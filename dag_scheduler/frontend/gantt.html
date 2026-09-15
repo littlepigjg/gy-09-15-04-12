@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>运行甘特图 · 任务时间轴分析</title>
+<!--
+  使用方法：
+  1. 默认展示 data/states/b61bf68b.json 这次运行；
+  2. 要看其它运行，点页面顶部「载入运行状态 JSON」选择 data/states/<run_id>.json；
+  3. 再可选「载入工作流 JSON」(data/workflows/<workflow_id>.json)，用于画依赖箭头和关键路径。
+  时间精度：直接解析状态文件里的微秒级 ISO 时间戳，甘特条长度 / 时间刻度 /
+  耗时数字全部来自同一份时间数据，严格成比例。
+-->
+<style>
+  :root {
+    --bg: #f4f6fa; --card: #ffffff; --ink: #1f2733; --sub: #66707d;
+    --grid: #e3e8ef; --blue: #2f7ed8; --red: #dc4f4f; --orange: #eda22e;
+    --gray: #9aa5b1; --green: #2fa36a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .muted { color: var(--sub); }
+  .toolbar {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    background: var(--card); border: 1px solid var(--grid); border-radius: 10px;
+    padding: 12px 16px; margin: 14px 0;
+  }
+  .toolbar label {
+    border: 1px solid #c6cedb; border-radius: 6px; padding: 5px 12px; cursor: pointer;
+    background: #fbfcfe; font-size: 12px;
+  }
+  .toolbar input { display: none; }
+  .toolbar .file-name { color: var(--sub); font-size: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--grid); border-radius: 10px; padding: 12px 14px;
+  }
+  .card .k { font-size: 12px; color: var(--sub); }
+  .card .v { font-size: 20px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .card .v small { font-size: 12px; font-weight: 400; color: var(--sub); }
+  .panel {
+    background: var(--card); border: 1px solid var(--grid); border-radius: 10px;
+    padding: 16px; margin-bottom: 14px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; }
+  svg { display: block; width: 100%; height: auto; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--sub); margin-top: 8px; }
+  .legend i { display: inline-block; width: 14px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  .findings li { margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th { color: var(--sub); font-weight: 600; background: #fafbfd; }
+  td.num { text-align: right; }
+  .badge { padding: 1px 8px; border-radius: 10px; font-size: 11px; color: #fff; }
+  .badge.success { background: var(--blue); }
+  .badge.failed  { background: var(--red); }
+  .badge.running { background: var(--orange); }
+  .badge.pending, .badge.skipped { background: var(--gray); }
+  #tip {
+    position: fixed; pointer-events: none; display: none; z-index: 10;
+    background: rgba(31,39,51,.94); color: #fff; border-radius: 8px; padding: 8px 11px;
+    font-size: 12px; line-height: 1.6; max-width: 320px; white-space: nowrap;
+  }
+  #tip b { font-size: 12.5px; }
+  #tip .tip-sub { color: #b9c2cf; }
+  .table-wrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>运行时间轴甘特图</h1>
+<div class="muted" id="run-meta">读取数据中…</div>
+
+<div class="toolbar">
+  <label>载入运行状态 JSON<input type="file" id="state-file" accept=".json,application/json"></label>
+  <span class="file-name" id="state-name">默认：data/states/b61bf68b.json</span>
+  <label>载入工作流 JSON（可选，用于依赖箭头 / 关键路径）<input type="file" id="wf-file" accept=".json,application/json"></label>
+  <span class="file-name" id="wf-name">默认：data/workflows/0318596f.json</span>
+</div>
+
+<div class="cards" id="cards"></div>
+
+<div class="panel">
+  <h2>甘特时间轴 · 并行度（任务条、刻度、并行度共用同一时间坐标）</h2>
+  <svg id="chart" xmlns="http://www.w3.org/2000/svg"></svg>
+  <div class="legend">
+    <span><i style="background:var(--blue)"></i>执行中（成功）</span>
+    <span><i style="background:var(--orange)"></i>执行中（运行中）</span>
+    <span><i style="background:var(--red)"></i>失败</span>
+    <span><i style="background:var(--gray)"></i>跳过/未调度</span>
+    <span><i style="background:repeating-linear-gradient(45deg,#c3cad5,#c3cad5 3px,#eef1f5 3px,#eef1f5 6px)"></i>无任务运行（框架/调度开销）</span>
+    <span>★ 关键路径任务</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>瓶颈 / 并行分析</h2>
+  <ul class="findings" id="findings"></ul>
+</div>
+
+<div class="panel">
+  <h2>任务明细（原始时间戳）</h2>
+  <div class="table-wrap">
+    <table id="detail-table">
+      <thead><tr>
+        <th>任务</th><th>状态</th><th>开始时间</th><th>结束时间</th>
+        <th class="num">耗时 (ms)</th><th class="num">起点偏移 起 (ms)</th><th class="num">起点偏移 止 (ms)</th><th>PID</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="tip"></div>
+
+<script>
+"use strict";
+
+/* ---------- 默认数据：run b61bf68b（成功）+ workflow 0318596f ---------- */
+const DEFAULT_STATE = {
+  "run_id": "b61bf68b",
+  "workflow_id": "0318596f",
+  "status": "success",
+  "start_time": "2026-09-14T21:21:06.803468",
+  "end_time": "2026-09-14T21:21:06.820253",
+  "task_instances": {
+    "task1": {
+      "task_id": "task1", "status": "success",
+      "start_time": "2026-09-14T21:21:06.806092",
+      "end_time":   "2026-09-14T21:21:06.812966",
+      "retry_count": 0, "process_id": 466390, "logs": ["Hello"]
+    },
+    "task2": {
+      "task_id": "task2", "status": "success",
+      "start_time": "2026-09-14T21:21:06.813756",
+      "end_time":   "2026-09-14T21:21:06.819357",
+      "retry_count": 0, "process_id": 466391, "logs": ["World"]
+    }
+  }
+};
+const DEFAULT_WORKFLOW = {
+  "id": "0318596f", "name": "测试工作流",
+  "tasks": [
+    { "id": "task1", "name": "任务1", "command": "echo Hello", "dependencies": [] },
+    { "id": "task2", "name": "任务2", "command": "echo World", "dependencies": ["task1"] }
+  ]
+};
+
+let STATE = DEFAULT_STATE;
+let WORKFLOW = DEFAULT_WORKFLOW;
+
+/* ---------- 微秒级时间戳解析（不丢精度） ---------- */
+function parseTs(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.(\d+)/.exec(s);
+  if (!m) return null;
+  const [, Y, Mo, D, H, Mi, Se, frac] = m;
+  const fracUs = (frac + "000000").slice(0, 6) | 0;
+  // u: 用 UTC 纪元微秒做差值运算；wall: 按本地钟面还原，仅用于展示
+  const u = Date.UTC(+Y, +Mo - 1, +D, +H, +Mi, +Se) * 1000 + fracUs;
+  const wall = new Date(+Y, +Mo - 1, +D, +H, +Mi, +Se).getTime() + fracUs / 1000;
+  return { u, wall, raw: s };
+}
+function clockStr(wallMs, usPart) {
+  const d = new Date(wallMs);
+  const p = n => String(n).padStart(2, "0");
+  const frac = String(Math.round(usPart)).padStart(6, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${frac}`;
+}
+const ms = us => us / 1000;
+function fmtMs(v) {
+  if (v < 10) return (v / 1000).toFixed(3);
+  if (v < 1000) return (v / 1000).toFixed(2);
+  if (v < 10000) return (v / 1000).toFixed(2);
+  return (v / 1e6).toFixed(3) + " s";
+}
+function fmtPct(x) { return (x * 100).toFixed(1) + "%"; }
+
+/* ---------- 由状态 + 工作流整理运行模型 ---------- */
+function buildModel(state, wf) {
+  const t0 = parseTs(state.start_time);
+  const t1 = state.end_time ? parseTs(state.end_time) : null;
+
+  const wfTask = {};
+  (wf?.tasks || []).forEach(t => { wfTask[t.id] = t; });
+
+  const tasks = Object.values(state.task_instances || {}).map(ti => {
+    const s = ti.start_time ? parseTs(ti.start_time) : null;
+    const e = ti.end_time ? parseTs(ti.end_time) : null;
+    const deps = (wfTask[ti.task_id]?.dependencies || []).slice();
+    return {
+      id: ti.task_id,
+      name: wfTask[ti.task_id]?.name || ti.task_id,
+      command: wfTask[ti.task_id]?.command || "",
+      status: ti.status,
+      start: s, end: e,
+      dur: s && e ? e.u - s.u : null,
+      pid: ti.process_id, retries: ti.retry_count,
+      deps
+    };
+  });
+
+  // 已开始的按开始时间排序，未开始的排最后
+  tasks.sort((a, b) =>
+    (a.start ? a.start.u : Infinity) - (b.start ? b.start.u : Infinity));
+
+  // 运行边界：优先 run 的起止；缺失时用任务的 min/max 兜底
+  let b0 = t0 ? t0.u : Math.min(...tasks.map(t => t.start.u));
+  let b1 = t1 ? t1.u : Math.max(...tasks.filter(t => t.end).map(t => t.end.u));
+  if (!isFinite(b1)) b1 = b0;
+
+  // 并行度事件：起点 +1，终点 -1；再补运行首尾边界，保证启动/收尾空闲段也入切分
+  const events = [{ t: b0, d: 0 }];
+  if (t1) events.push({ t: b1, d: 0 });
+  tasks.forEach(t => {
+    if (t.start) events.push({ t: t.start.u, d: +1, task: t.id });
+    if (t.end)   events.push({ t: t.end.u,   d: -1, task: t.id });
+  });
+  events.sort((a, b) => a.t - b.t || a.d - b.d); // 同一时刻先结束后开始
+
+  // 切段：[left,right] 内并行任务数恒定
+  const segs = [];
+  let running = new Set();
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (ev.d === 1) running.add(ev.task);
+    if (ev.d === -1) running.delete(ev.task);
+    const next = events[i + 1];
+    if (next && next.t > ev.t && ev.t >= b0 - 1) {
+      segs.push({ l: Math.max(ev.t, b0), r: next.t, n: running.size, tasks: [...running] });
+    }
+  }
+  if (!segs.length) segs.push({ l: b0, r: b1, n: 0, tasks: [] });
+
+  // 空闲段（无任务运行）= 框架 / 调度开销
+  const idle = segs.filter(s => s.n === 0 && s.r - s.l > 0).map((s, idx, arr) => ({
+    ...s,
+    kind: idx === 0 ? "启动开销（进程拉起/调度器准备）"
+        : idx === arr.length - 1 ? "收尾开销（结果写盘/状态回收）"
+        : "调度间隙（等待依赖/调度延迟）"
+  }));
+
+  const busy = tasks.reduce((a, t) => a + (t.dur || 0), 0);
+  const wall = b1 - b0;
+  const maxPar = Math.max(1, ...segs.map(s => s.n));
+  const avgPar = wall > 0 ? busy / wall : 0;
+
+  // 关键路径：以真实耗时为权重，在依赖图上做最长路（无依赖信息时退化为最长任务）
+  const byId = {}; tasks.forEach(t => byId[t.id] = t);
+  const memo = {};
+  function cp(id) {
+    if (memo[id]) return memo[id];
+    const t = byId[id];
+    let best = { w: 0, path: [] };
+    (t?.deps || []).forEach(d => {
+      if (byId[d]) { const r = cp(d); if (r.w > best.w) best = r; }
+    });
+    return memo[id] = { w: best.w + (t.dur || 0), path: [...best.path, id] };
+  }
+  let crit = { w: 0, path: [] };
+  tasks.forEach(t => { const r = cp(t.id); if (r.w > crit.w) crit = r; });
+  if (!crit.path.length && tasks.length) crit = { w: tasks[0].dur || 0, path: [tasks[0].id] };
+  const critSet = new Set(crit.path);
+
+  return { tasks, b0, b1, wall, busy, idle, segs, maxPar, avgPar,
+           critical: crit, critSet, t0, t1, running: state.status };
+}
+
+/* ---------- 渲染 ---------- */
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(name, attrs = {}, parent) {
+  const n = document.createElementNS(SVGNS, name);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+
+const STATUS_COLOR = {
+  success: "#2f7ed8", failed: "#dc4f4f", running: "#eda22e",
+  skipped: "#9aa5b1", pending: "#9aa5b1"
+};
+
+function render(state, wf) {
+  const m = buildModel(state, wf);
+  document.getElementById("run-meta").textContent =
+    `run_id=${state.run_id} · workflow=${state.workflow_id} · 状态=${state.status} · ` +
+    `${state.start_time} → ${state.end_time ?? "（未结束）"}`;
+
+  renderCards(m);
+  renderChart(m);
+  renderFindings(m, state);
+  renderTable(m);
+}
+
+function renderCards(m) {
+  const cards = [
+    ["总耗时（墙钟）", fmtMs(m.wall) + " <small>ms</small>"],
+    ["任务执行合计", fmtMs(m.busy) + ` <small>ms · ${fmtPct(m.wall ? m.busy / m.wall : 0)}</small>`],
+    ["框架/调度开销", fmtMs(m.wall - m.busy) + ` <small>ms · ${fmtPct(m.wall ? (m.wall - m.busy) / m.wall : 0)}</small>`],
+    ["峰值并行度", m.maxPar + ` <small>个任务同时运行</small>`],
+    ["平均并行度", m.avgPar.toFixed(2) + ` <small>= 执行合计 / 总耗时</small>`],
+    ["最长任务", `${longest(m).id} <small>${fmtMs(longest(m).dur)} ms</small>`],
+  ];
+  document.getElementById("cards").innerHTML = cards.map(
+    ([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`
+  ).join("");
+}
+function longest(m) {
+  return m.tasks.reduce((a, t) => (t.dur ?? -1) > (a.dur ?? -1) ? t : a, m.tasks[0] || {});
+}
+
+function renderChart(m) {
+  const svg = document.getElementById("chart");
+  svg.innerHTML = "";
+
+  const W = 1180, L = 170, Rpad = 30;
+  const plotW = W - L - Rpad;
+  const axisH = 30, rowH = 42, gap = 16, stripH = 96;
+  const rows = m.tasks.length;
+  const H = axisH + 8 + rows * rowH + gap + stripH + 14;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+  // 两侧各留 3% 余量；坐标变换唯一，任务条 / 空闲段 / 并行度 / 刻度全部用它
+  const pad = m.wall * 0.03 || 1000;
+  const tMin = m.b0 - pad, tMax = m.b1 + pad;
+  const span = tMax - tMin;
+  const X = u => L + (u - tMin) / span * plotW;
+
+  /* 美观刻度 */
+  const spanMs = ms(span);
+  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500,
+                 1000, 2000, 5000, 10000, 30000, 60000];
+  let stepMs = steps[steps.length - 1] * 10;
+  for (const s of steps) { if (spanMs / s <= 12) { stepMs = s; break; } }
+  const stepUs = stepMs * 1000;
+  const tick0 = Math.ceil(tMin / stepUs) * stepUs;
+
+  const axisTop = 6, plotTop = axisTop + axisH;
+  const ganttBottom = plotTop + rows * rowH;
+  const stripTop = ganttBottom + gap;
+  const stripBottom = stripTop + stripH;
+
+  /* 网格线 + 刻度（纵贯甘特区和并行度带，证明同一时间坐标） */
+  for (let t = tick0; t <= tMax; t += stepUs) {
+    const x = X(t);
+    el("line", { x1: x, x2: x, y1: axisTop, y2: stripBottom,
+      stroke: "#e3e8ef", "stroke-width": 1 }, svg);
+    const rel = ((t - m.b0) / 1000).toFixed(3);
+    const tx = el("text", { x, y: axisTop + 16, "text-anchor": "middle",
+      "font-size": 10.5, fill: "#66707d" }, svg);
+    tx.textContent = `+${rel} ms`;
+  }
+
+  // 运行边界竖线：起点 = 0，终点 = 总耗时
+  el("line", { x1: X(m.b0), x2: X(m.b0), y1: axisTop, y2: stripBottom,
+    stroke: "#1f2733", "stroke-width": 1.4, "stroke-dasharray": "4 3" }, svg);
+  el("line", { x1: X(m.b1), x2: X(m.b1), y1: axisTop, y2: stripBottom,
+    stroke: "#1f2733", "stroke-width": 1.4, "stroke-dasharray": "4 3" }, svg);
+  const endLab = el("text", { x: X(m.b1) - 4, y: axisTop + 16, "text-anchor": "end",
+    "font-size": 10.5, fill: "#1f2733", "font-weight": 600 }, svg);
+  endLab.textContent = `总耗时 ${fmtMs(m.wall)} ms`;
+
+  // 起点绝对钟面
+  const startLab = el("text", { x: X(m.b0) + 4, y: axisTop + 28, "text-anchor": "start",
+    "font-size": 10, fill: "#66707d" }, svg);
+  startLab.textContent = clockStr(m.t0.wall, m.t0.u % 1000000) + "（起点）";
+
+  /* 空闲段（开销）画成斜纹带，覆盖全部甘特行高度 */
+  const defs = el("defs", {}, svg);
+  const pat = el("pattern", { id: "hatch", width: 6, height: 6,
+    patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, defs);
+  el("rect", { width: 6, height: 6, fill: "#eef1f5" }, pat);
+  el("line", { x1: 0, y1: 0, x2: 0, y2: 6, stroke: "#c3cad5", "stroke-width": 2 }, pat);
+
+  m.idle.forEach((s) => {
+    const x = X(s.l), w = Math.max(1, X(s.r) - x);
+    el("rect", { x, y: plotTop, width: w, height: rows * rowH,
+      fill: "url(#hatch)", opacity: 0.9 }, svg);
+    if (w > 46) {
+      const t = el("text", { x: x + w / 2, y: plotTop + 12, "text-anchor": "middle",
+        "font-size": 10, fill: "#8a94a2" }, svg);
+      t.textContent = `${s.kind.split("（")[0]} ${fmtMs(s.r - s.l)} ms`;
+    }
+    tipZone(el("rect", { x, y: plotTop, width: w, height: rows * rowH,
+      fill: "transparent", cursor: "help" }, svg),
+      `<b>无任务运行 · ${fmtMs(s.r - s.l)} ms</b><br>` +
+      `<span class="tip-sub">${s.kind}</span><br>` +
+      `<span class="tip-sub">+${fmtMs(s.l - m.b0)} → +${fmtMs(s.r - m.b0)} ms</span>`);
+  });
+
+  /* 任务条 */
+  m.tasks.forEach((t, i) => {
+    const y = plotTop + i * rowH + 9;
+    const barH = rowH - 18;
+
+    // 行名
+    const name = el("text", { x: L - 10, y: y + barH / 2 + 4, "text-anchor": "end",
+      "font-size": 12, fill: "#1f2733", "font-weight": 600 }, svg);
+    name.textContent = `${t.name} (${t.id})`;
+    el("line", { x1: L, x2: W - Rpad, y1: plotTop + i * rowH, y2: plotTop + i * rowH,
+      stroke: "#eef1f5" }, svg);
+
+    if (!t.start) {
+      const q = el("text", { x: L + 6, y: y + barH / 2 + 4, "font-size": 11, fill: "#9aa5b1" }, svg);
+      q.textContent = `未开始调度（状态 ${t.status}）`;
+      return;
+    }
+
+    // 运行中任务没有 end：条画到运行边界
+    const endU = t.end ? t.end.u : m.b1;
+    const x = X(t.start.u), w = Math.max(2, X(endU) - x);
+    const color = STATUS_COLOR[t.status] || "#9aa5b1";
+    const bar = el("rect", { x, y, width: w, height: barH, rx: 4,
+      fill: color, stroke: m.critSet.has(t.id) ? "#1f2733" : "none",
+      "stroke-width": m.critSet.has(t.id) ? 1.6 : 0 }, svg);
+
+    // 条上文字：放不放得下由真实像素宽度决定（与刻度同一比例）
+    const label = `${t.name} · ${t.dur != null ? fmtMs(t.dur) + " ms" : "运行中…"}`;
+    const tx = el("text", { y: y + barH / 2 + 4, "font-size": 11.5,
+      fill: w > 92 ? "#fff" : "#1f2733", "font-weight": 600,
+      "text-anchor": w > 92 ? "middle" : "start",
+      "pointer-events": "none" }, svg);
+    tx.setAttribute("x", w > 92 ? x + w / 2 : x + w + 6);
+    tx.textContent = label;
+
+    if (m.critSet.has(t.id) && w > 22) {
+      const star = el("text", { x: w > 92 ? x + 6 : x - 14, y: y + barH / 2 + 4,
+        "font-size": 11, fill: w > 92 ? "#fff" : "#1f2733", "pointer-events": "none" }, svg);
+      star.textContent = "★";
+    }
+
+    // 起止小刻度
+    el("line", { x1: x, x2: x, y1: y - 3, y2: y + barH + 3, stroke: color, "stroke-width": 1.2 }, svg);
+    if (t.end) el("line", { x1: x + w, x2: x + w, y1: y - 3, y2: y + barH + 3,
+      stroke: color, "stroke-width": 1.2 }, svg);
+
+    tipZone(bar,
+      `<b>${t.name} (${t.id})</b> · <span class="tip-sub">${t.status}</span><br>` +
+      `<span class="tip-sub">命令：${t.command || "—"}</span><br>` +
+      `开始：${t.start.raw}<br>` +
+      `结束：${t.end ? t.end.raw : "（未结束）"}<br>` +
+      `耗时：<b>${t.dur != null ? fmtMs(t.dur) + " ms" : "—"}</b>` +
+      (t.pid ? `<br><span class="tip-sub">PID ${t.pid}${t.retries ? " · 重试 " + t.retries + " 次" : ""}</span>` : ""));
+  });
+
+  /* 依赖箭头：前驱任务条尾 → 后继任务条头 */
+  const arrowId = "arrow";
+  const mk = el("marker", { id: arrowId, markerWidth: 8, markerHeight: 8,
+    refX: 7, refY: 3, orient: "auto", markerUnits: "userSpaceOnUse" }, defs);
+  el("path", { d: "M0,0 L7,3 L0,6 Z", fill: "#66707d" }, mk);
+
+  m.tasks.forEach((t, i) => {
+    if (!t.start) return;
+    const yHead = plotTop + i * rowH + 9 + (rowH - 18) / 2;
+    t.deps.forEach(depId => {
+      const j = m.tasks.findIndex(x => x.id === depId);
+      if (j < 0 || !m.tasks[j].end) return;
+      const dep = m.tasks[j];
+      const x1 = X(dep.end.u), y1 = plotTop + j * rowH + 9 + (rowH - 18);
+      const x2 = X(t.start.u), y2 = yHead;
+      const my = (y1 + y2) / 2;
+      el("path", {
+        d: `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2 - 2},${y2}`,
+        fill: "none", stroke: "#66707d", "stroke-width": 1.2,
+        "stroke-dasharray": "3 2", markerEnd: `url(#${arrowId})` }, svg);
+    });
+  });
+
+  /* ---- 并行度带：同一 x 坐标的阶梯面积 ---- */
+  el("rect", { x: L, y: stripTop, width: plotW, height: stripH,
+    fill: "#fafbfd", stroke: "#e3e8ef" }, svg);
+  const parMax = Math.max(1, m.maxPar);
+  const PY = n => stripTop + stripH - (n / parMax) * (stripH - 22) - 6;
+
+  // 只画运行边界内的段
+  const segs = m.segs.filter(s => s.r > m.b0 && s.l < m.b1)
+    .map(s => ({ ...s, l: Math.max(s.l, m.b0), r: Math.min(s.r, m.b1) }));
+  let d = `M${X(m.b0)},${PY(0)} `;
+  segs.forEach(s => { d += `L${X(s.l)},${PY(s.n)} L${X(s.r)},${PY(s.n)} `; });
+  d += `L${X(m.b1)},${PY(0)} L${X(m.b1)},${stripTop + stripH - 6} L${X(m.b0)},${stripTop + stripH - 6} Z`;
+  el("path", { d, fill: "rgba(47,126,216,0.16)", stroke: "none" }, svg);
+
+  let dLine = `M${X(m.b0)},${PY(0)} `;
+  segs.forEach(s => { dLine += `L${X(s.l)},${PY(s.n)} L${X(s.r)},${PY(s.n)} `; });
+  el("path", { d: dLine, fill: "none", stroke: "#2f7ed8", "stroke-width": 1.6 }, svg);
+
+  // 段内标并行数；0 的段弱化显示
+  segs.forEach(s => {
+    const cx = (X(s.l) + X(s.r)) / 2;
+    if (X(s.r) - X(s.l) > 22) {
+      const t = el("text", { x: cx, y: PY(s.n) - 5, "text-anchor": "middle",
+        "font-size": 10.5, fill: s.n ? "#2f7ed8" : "#a3acb8", "font-weight": 600 }, svg);
+      t.textContent = s.n;
+    }
+    if (s.n >= 1) {
+      tipZone(el("rect", { x: X(s.l), y: stripTop, width: X(s.r) - X(s.l),
+        height: stripH, fill: "transparent", cursor: "help" }, svg),
+        `<b>${s.n} 个任务并行</b> · 持续 ${fmtMs(s.r - s.l)} ms<br>` +
+        `<span class="tip-sub">${s.tasks.join("、") || "空闲"}</span><br>` +
+        `<span class="tip-sub">+${fmtMs(s.l - m.b0)} → +${fmtMs(s.r - m.b0)} ms</span>`);
+    }
+  });
+
+  // y 轴刻度 0..max
+  for (let n = 0; n <= parMax; n++) {
+    const t = el("text", { x: L - 8, y: PY(n) + 3.5, "text-anchor": "end",
+      "font-size": 10, fill: "#66707d" }, svg);
+    t.textContent = n;
+  }
+  const cap = el("text", { x: L, y: stripTop - 5, "font-size": 11,
+    fill: "#1f2733", "font-weight": 600 }, svg);
+  cap.textContent = `并行任务数（峰值 ${m.maxPar}，时间轴与上方甘特图完全对齐）`;
+}
+
+/* ---------- 分析结论 ---------- */
+function renderFindings(m, state) {
+  const f = [];
+  const busyPct = m.wall ? m.busy / m.wall : 0;
+  const overhead = m.wall - m.busy;
+  const lng = longest(m);
+
+  if (m.maxPar <= 1) {
+    f.push(`<b>全程无并行</b>：任意时刻最多只有 ${m.maxPar} 个任务在跑，平均并行度 ${m.avgPar.toFixed(2)}。` +
+      `这次是严格串行执行（依赖链：${m.critical.path.join(" → ")}），DAG 的并行能力完全没有被利用 —— 若存在互不依赖的任务，让它们并发可直接缩短墙钟时间。`);
+  } else {
+    // 最繁忙的一段
+    let peak = m.segs.filter(s => s.n === m.maxPar)
+      .reduce((a, s) => (s.r - s.l > (a.r - a.l) ? s : a), { l: 0, r: 0, tasks: [] });
+    f.push(`<b>峰值并行度 ${m.maxPar}</b>，出现在 +${fmtMs(peak.l - m.b0)} ms 起、` +
+      `持续 ${fmtMs(peak.r - peak.l)} ms 的区间（${peak.tasks.join("、")}）；平均并行度 ${m.avgPar.toFixed(2)}。`);
+  }
+
+  f.push(`<b>执行瓶颈（关键路径上最长的任务）</b>：<b>${lng.name} (${lng.id})</b> 耗时 ` +
+    `<b>${fmtMs(lng.dur)} ms</b>，占总墙钟 ${fmtPct(m.wall ? lng.dur / m.wall : 0)}。` +
+    `关键路径（${m.critical.path.join(" → ")}）合计 ${fmtMs(m.critical.w)} ms，` +
+    `理论上这条链决定了本次运行的最短可能耗时，优化它收益最大。`);
+
+  if (overhead > 0) {
+    const biggest = m.idle.reduce((a, s) => (s.r - s.l > (a.r - a.l) ? s : a),
+      { l: m.b0, r: m.b0, kind: "—" });
+    const where = biggest.tasks
+      ? "" : labelGap(m, biggest);
+    f.push(`<b>非执行开销占 ${fmtPct(1 - busyPct)}</b>（${fmtMs(overhead)} ms / ${fmtMs(m.wall)} ms）：` +
+      `启动与收尾、调度间隙里没有任何任务在跑。最大一段是「${biggest.kind.split("（")[0]}」` +
+      `${fmtMs(biggest.r - biggest.l)} ms${where}。这部分主要是进程拉起（echo 类毫秒任务下尤其明显）与状态写盘，` +
+      `任务本身越短，开销占比越显眼。`);
+  }
+
+  if (state.status !== "success") {
+    f.push(`本次运行状态为 <b>${state.status}</b>，任务未全部完成，结论仅基于已产生的时间数据。`);
+  }
+
+  document.getElementById("findings").innerHTML = f.map(x => `<li>${x}</li>`).join("");
+}
+function labelGap(m, seg) {
+  // 用段前段后的任务描述空隙位置
+  const before = m.tasks.filter(t => t.end && t.end.u <= seg.l + 1)
+    .sort((a, b) => b.end.u - a.end.u)[0];
+  const after = m.tasks.filter(t => t.start && t.start.u >= seg.r - 1)
+    .sort((a, b) => a.start.u - b.start.u)[0];
+  if (before && after) return `（${before.id} 结束 → ${after.id} 启动之间）`;
+  if (!before && after) return `（运行开始 → ${after.id} 启动）`;
+  if (before && !after) return `（${before.id} 结束 → 运行结束）`;
+  return "";
+}
+
+/* ---------- 明细表 ---------- */
+function renderTable(m) {
+  const tb = document.querySelector("#detail-table tbody");
+  tb.innerHTML = m.tasks.map(t => `
+    <tr>
+      <td><b>${t.name}</b> <span class="muted">(${t.id})</span>${m.critSet.has(t.id) ? " ★" : ""}</td>
+      <td><span class="badge ${t.status}">${t.status}</span></td>
+      <td>${t.start ? t.start.raw : "—"}</td>
+      <td>${t.end ? t.end.raw : "—"}</td>
+      <td class="num">${t.dur != null ? fmtMs(t.dur) : "—"}</td>
+      <td class="num">${t.start ? fmtMs(t.start.u - m.b0) : "—"}</td>
+      <td class="num">${t.end ? fmtMs(t.end.u - m.b0) : "—"}</td>
+      <td>${t.pid ?? "—"}</td>
+    </tr>`).join("");
+}
+
+/* ---------- tooltip ---------- */
+const tip = document.getElementById("tip");
+function tipZone(node, html) {
+  node.addEventListener("mousemove", e => {
+    tip.innerHTML = html;
+    tip.style.display = "block";
+    const w = tip.offsetWidth;
+    tip.style.left = Math.min(e.clientX + 14, window.innerWidth - w - 10) + "px";
+    tip.style.top = (e.clientY + 16) + "px";
+  });
+  node.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+}
+
+/* ---------- 文件载入 ---------- */
+function readJson(input, cb) {
+  const f = input.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    try { cb(JSON.parse(r.result)); }
+    catch (e) { alert("JSON 解析失败：" + e.message); }
+  };
+  r.readAsText(f);
+}
+document.getElementById("state-file").addEventListener("change", function () {
+  document.getElementById("state-name").textContent = this.files[0]?.name || "";
+  readJson(this, data => { STATE = data; render(STATE, WORKFLOW); });
+});
+document.getElementById("wf-file").addEventListener("change", function () {
+  document.getElementById("wf-name").textContent = this.files[0]?.name || "";
+  readJson(this, data => { WORKFLOW = data; render(STATE, WORKFLOW); });
+});
+
+render(STATE, WORKFLOW);
+</script>
+</body>
+</html>
